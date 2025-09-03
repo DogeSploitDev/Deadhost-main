@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: render-proxy-backend
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Mode A: uncomment to reverse-proxy one upstream
+      # - key: BASE_UPSTREAM
+      #   value: https://example.com
+      # Protection (optional)
+      # - key: PROXY_USER
+      #   value: user
+      # - key: PROXY_PASS
+      #   value: pass
+      # Allow specific hosts in URL mode
+      # - key: ALLOWLIST
+      #   value: api.github.com,example.com
+      # Enable CORS for API usage (optional)
+      # - key: ENABLE_CORS
+      #   value: "true"
+a
