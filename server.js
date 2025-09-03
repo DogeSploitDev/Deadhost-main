@@ -5,7 +5,7 @@ import compression from 'compression';
 import morgan from 'morgan';
 import httpProxy from 'http-proxy';
 import rateLimit from 'express-rate-limit';
-import { StringDecoder } from 'string_decoder';
+import { Transform } from 'stream';
 
 const app = express();
 const server = http.createServer(app);
@@ -17,6 +17,7 @@ const PROXY_USER = process.env.PROXY_USER || '';
 const PROXY_PASS = process.env.PROXY_PASS || '';
 const ALLOWLIST = (process.env.ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 const ENABLE_CORS = (process.env.ENABLE_CORS || 'false').toLowerCase() === 'true';
+const STRIP_CSP = (process.env.STRIP_CSP || 'false').toLowerCase() === 'true';
 
 const limiter = rateLimit({
   windowMs: 60_000,
@@ -28,7 +29,7 @@ const limiter = rateLimit({
 app.use(limiter);
 app.use(compression());
 app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
-app.use(express.raw({ type: '*/*', limit: '20mb' }));
+app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 if (ENABLE_CORS) {
   app.use((req, res, next) => {
@@ -77,62 +78,70 @@ const proxy = httpProxy.createProxyServer({
   secure: true,
   ws: true,
   xfwd: true,
-  selfHandleResponse: true // so we can rewrite HTML
+  selfHandleResponse: true
 });
+
+function rewriteHtmlStream(target, selfOrigin) {
+  return new Transform({
+    decodeStrings: false,
+    transform(chunk, encoding, callback) {
+      let html = chunk.toString('utf8');
+      html = html.replace(/(href|src|action)=["']([^"']+)["']/gi, (m, attr, url) => {
+        try {
+          const abs = new URL(url, target);
+          return `${attr}="${BASE_UPSTREAM ? selfOrigin + abs.pathname + abs.search : '/?url=' + encodeURIComponent(abs.toString())}"`;
+        } catch {
+          return m;
+        }
+      });
+      html = html.replace(/url\((['"]?)([^'")]+)\1\)/gi, (m, quote, url) => {
+        try {
+          const abs = new URL(url, target);
+          return `url(${quote}${BASE_UPSTREAM ? selfOrigin + abs.pathname + abs.search : '/?url=' + encodeURIComponent(abs.toString())}${quote})`;
+        } catch {
+          return m;
+        }
+      });
+      callback(null, html);
+    }
+  });
+}
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const target = res.locals.__targetUrl;
   const selfOrigin = `${req.protocol}://${req.headers['x-forwarded-host'] || req.headers.host}`;
 
-  // Rewrite cookies
+  // Cookie rewrite
   const setCookie = proxyRes.headers['set-cookie'];
   if (setCookie && Array.isArray(setCookie)) {
-    proxyRes.headers['set-cookie'] = setCookie.map((cookie) => {
-      return cookie
-        .replace(/;\s*Domain=[^;]*/i, `; Domain=${new URL(selfOrigin).hostname}`)
-        .replace(/;\s*Path=[^;]*/i, `; Path=/`);
-    });
+    proxyRes.headers['set-cookie'] = setCookie.map(c =>
+      c.replace(/;\s*Domain=[^;]*/i, `; Domain=${new URL(selfOrigin).hostname}`)
+       .replace(/;\s*Path=[^;]*/i, `; Path=/`)
+    );
   }
 
-  // Rewrite redirects
+  // Redirect rewrite
   const loc = proxyRes.headers['location'];
   if (loc && target) {
     try {
       const abs = new URL(loc, target);
-      if (BASE_UPSTREAM) {
-        proxyRes.headers['location'] = `${selfOrigin}${abs.pathname}${abs.search}`;
-      } else {
-        proxyRes.headers['location'] = `${selfOrigin}/?url=${encodeURIComponent(abs.toString())}`;
-      }
+      proxyRes.headers['location'] = BASE_UPSTREAM
+        ? `${selfOrigin}${abs.pathname}${abs.search}`
+        : `${selfOrigin}/?url=${encodeURIComponent(abs.toString())}`;
     } catch {}
   }
 
-  // HTML rewriting
+  if (STRIP_CSP) {
+    delete proxyRes.headers['content-security-policy'];
+    delete proxyRes.headers['x-frame-options'];
+  }
+
   const contentType = proxyRes.headers['content-type'] || '';
+  res.writeHead(proxyRes.statusCode, proxyRes.headers);
+
   if (contentType.includes('text/html')) {
-    let body = '';
-    const decoder = new StringDecoder('utf8');
-    proxyRes.on('data', chunk => { body += decoder.write(chunk); });
-    proxyRes.on('end', () => {
-      body += decoder.end();
-      body = body.replace(/(href|src|action)=["']([^"']+)["']/gi, (m, attr, url) => {
-        try {
-          const abs = new URL(url, target);
-          if (BASE_UPSTREAM) {
-            return `${attr}="${selfOrigin}${abs.pathname}${abs.search}"`;
-          } else {
-            return `${attr}="/?url=${encodeURIComponent(abs.toString())}"`;
-          }
-        } catch {
-          return m;
-        }
-      });
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      res.end(body);
-    });
+    proxyRes.pipe(rewriteHtmlStream(target, selfOrigin)).pipe(res);
   } else {
-    // Non-HTML: stream directly
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   }
 });
@@ -144,13 +153,10 @@ proxy.on('error', (err, req, res) => {
 });
 
 app.get('/healthz', (req, res) => res.status(200).send('ok'));
-
 app.use(basicAuth);
 
-// Catch-all proxy
 app.all('*', (req, res) => {
   let targetUrl = resolveTarget(req);
-
   if (!targetUrl && !BASE_UPSTREAM) {
     const q = req.query.url || req.originalUrl;
     try {
@@ -159,7 +165,6 @@ app.all('*', (req, res) => {
       return res.status(400).json({ error: 'Invalid target URL' });
     }
   }
-
   if (!targetUrl) return res.status(400).json({ error: 'No target URL' });
   if (!/^https?:$/.test(targetUrl.protocol)) return res.status(400).json({ error: 'Unsupported protocol' });
   if (!isAllowedHost(targetUrl.hostname)) return res.status(403).json({ error: 'Host not allowed' });
@@ -175,13 +180,11 @@ app.all('*', (req, res) => {
   });
 });
 
-// WebSocket upgrades
 server.on('upgrade', (req, socket, head) => {
   let targetUrl = null;
   if (BASE_UPSTREAM) {
     try {
-      const base = new URL(BASE_UPSTREAM);
-      targetUrl = new URL(req.url, base);
+      targetUrl = new URL(req.url, new URL(BASE_UPSTREAM));
     } catch {
       socket.destroy();
       return;
@@ -208,7 +211,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Proxy listening on :${PORT}`);
+  console.log(`🚀 Proxy listening on :${PORT}`);
   if (BASE_UPSTREAM) {
     console.log(`Reverse proxy mode → ${BASE_UPSTREAM}`);
   } else {
