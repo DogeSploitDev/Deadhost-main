@@ -1,36 +1,23 @@
 import express from 'express';
 import http from 'http';
-import https from 'https';
 import { URL } from 'url';
 import compression from 'compression';
 import morgan from 'morgan';
 import httpProxy from 'http-proxy';
 import rateLimit from 'express-rate-limit';
+import { StringDecoder } from 'string_decoder';
 
 const app = express();
 const server = http.createServer(app);
 
-// Config via env
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
-
-// Mode A: reverse proxy a single upstream (set BASE_UPSTREAM to enable)
-// e.g., BASE_UPSTREAM=https://example.com
 const BASE_UPSTREAM = process.env.BASE_UPSTREAM || '';
-
-// Mode B: on-demand proxy via `?url=` when BASE_UPSTREAM is empty
-// Optional Basic Auth for protection
 const PROXY_USER = process.env.PROXY_USER || '';
 const PROXY_PASS = process.env.PROXY_PASS || '';
-
-// Optional comma-separated allowlist of hostnames to proxy
-// e.g., ALLOWLIST=api.github.com,example.com
 const ALLOWLIST = (process.env.ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
-
-// CORS for API use (disable for pure website proxy)
 const ENABLE_CORS = (process.env.ENABLE_CORS || 'false').toLowerCase() === 'true';
 
-// Basic rate limit (tune to your needs)
 const limiter = rateLimit({
   windowMs: 60_000,
   limit: 300,
@@ -64,23 +51,18 @@ function basicAuth(req, res, next) {
 }
 
 function isAllowedHost(hostname) {
-  if (!ALLOWLIST.length) return true; // no allowlist → allow all
+  if (!ALLOWLIST.length) return true;
   return ALLOWLIST.includes(hostname);
 }
 
 function resolveTarget(req) {
-  // Mode A: single upstream
   if (BASE_UPSTREAM) {
     const upstream = new URL(BASE_UPSTREAM);
-    // Preserve original path and query
     const joined = new URL(req.originalUrl, upstream);
-    // originalUrl includes the path; we want to map "/" of our app to upstream "/"
-    // For clean mapping, strip our origin part:
     joined.pathname = req.path;
     joined.search = req.url.split('?')[1] ? '?' + req.url.split('?')[1] : '';
     return joined;
   }
-  // Mode B: url query param
   const q = req.query.url;
   if (!q) return null;
   try {
@@ -94,50 +76,67 @@ const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
   secure: true,
   ws: true,
-  xfwd: true
+  xfwd: true,
+  selfHandleResponse: true // so we can rewrite HTML
 });
 
-// Safety + polish on proxied response
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const target = res.locals.__targetUrl;
   const selfOrigin = `${req.protocol}://${req.headers['x-forwarded-host'] || req.headers.host}`;
 
-  // Rewrite Set-Cookie Domain and Path to current host
+  // Rewrite cookies
   const setCookie = proxyRes.headers['set-cookie'];
   if (setCookie && Array.isArray(setCookie)) {
     proxyRes.headers['set-cookie'] = setCookie.map((cookie) => {
-      let c = cookie
+      return cookie
         .replace(/;\s*Domain=[^;]*/i, `; Domain=${new URL(selfOrigin).hostname}`)
         .replace(/;\s*Path=[^;]*/i, `; Path=/`);
-      return c;
     });
   }
 
-  // Rewrite Location redirects to stay within the proxy
+  // Rewrite redirects
   const loc = proxyRes.headers['location'];
   if (loc && target) {
     try {
       const abs = new URL(loc, target);
-      // If redirect points to target's origin, map back through proxy entry
-      if (abs.origin === target.origin) {
-        if (BASE_UPSTREAM) {
-          proxyRes.headers['location'] = `${selfOrigin}${abs.pathname}${abs.search}`;
-        } else {
-          proxyRes.headers['location'] = `${selfOrigin}/proxy?url=${encodeURIComponent(abs.toString())}`;
-        }
+      if (BASE_UPSTREAM) {
+        proxyRes.headers['location'] = `${selfOrigin}${abs.pathname}${abs.search}`;
+      } else {
+        proxyRes.headers['location'] = `${selfOrigin}/?url=${encodeURIComponent(abs.toString())}`;
       }
-    } catch {
-      // leave as-is
-    }
+    } catch {}
   }
 
-  // Optional: loosen CSP for embedding (comment out if not needed)
-  // if (proxyRes.headers['content-security-policy']) {
-  //   delete proxyRes.headers['content-security-policy'];
-  // }
+  // HTML rewriting
+  const contentType = proxyRes.headers['content-type'] || '';
+  if (contentType.includes('text/html')) {
+    let body = '';
+    const decoder = new StringDecoder('utf8');
+    proxyRes.on('data', chunk => { body += decoder.write(chunk); });
+    proxyRes.on('end', () => {
+      body += decoder.end();
+      body = body.replace(/(href|src|action)=["']([^"']+)["']/gi, (m, attr, url) => {
+        try {
+          const abs = new URL(url, target);
+          if (BASE_UPSTREAM) {
+            return `${attr}="${selfOrigin}${abs.pathname}${abs.search}"`;
+          } else {
+            return `${attr}="/?url=${encodeURIComponent(abs.toString())}"`;
+          }
+        } catch {
+          return m;
+        }
+      });
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      res.end(body);
+    });
+  } else {
+    // Non-HTML: stream directly
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  }
 });
 
-// Robust error handling
 proxy.on('error', (err, req, res) => {
   if (!res.headersSent) {
     res.status(502).json({ error: 'Upstream proxy error', detail: err.message });
@@ -148,55 +147,41 @@ app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
 app.use(basicAuth);
 
-// Main proxy route(s)
-app.all(['/proxy', '/proxy/*'], (req, res) => {
-  const targetUrl = resolveTarget(req);
-  if (!targetUrl) return res.status(400).json({ error: 'Missing or invalid url. Provide ?url=...' });
+// Catch-all proxy
+app.all('*', (req, res) => {
+  let targetUrl = resolveTarget(req);
 
-  if (!/^https?:$/.test(targetUrl.protocol)) {
-    return res.status(400).json({ error: 'Only http and https are supported' });
+  if (!targetUrl && !BASE_UPSTREAM) {
+    const q = req.query.url || req.originalUrl;
+    try {
+      targetUrl = new URL(q.startsWith('http') ? q : `http://${q}`);
+    } catch {
+      return res.status(400).json({ error: 'Invalid target URL' });
+    }
   }
 
-  if (!isAllowedHost(targetUrl.hostname)) {
-    return res.status(403).json({ error: 'Target host not allowed' });
-  }
+  if (!targetUrl) return res.status(400).json({ error: 'No target URL' });
+  if (!/^https?:$/.test(targetUrl.protocol)) return res.status(400).json({ error: 'Unsupported protocol' });
+  if (!isAllowedHost(targetUrl.hostname)) return res.status(403).json({ error: 'Host not allowed' });
 
   res.locals.__targetUrl = targetUrl;
-
-  // For transparent path mapping in reverse mode, adjust req.url only in Mode A
-  if (BASE_UPSTREAM) {
-    req.url = targetUrl.pathname + targetUrl.search;
-  }
-
-  // Tweak headers to look like a normal browser if needed
   req.headers.host = targetUrl.host;
 
   proxy.web(req, res, {
     target: `${targetUrl.protocol}//${targetUrl.host}`,
     prependPath: false,
-    ignorePath: !BASE_UPSTREAM, // in URL mode, we already pass the full URL
-    selfHandleResponse: false,
+    ignorePath: !BASE_UPSTREAM,
     secure: true
   });
 });
 
-// Root mapping in reverse mode (optional convenience)
-if (BASE_UPSTREAM) {
-  app.all('*', (req, res, next) => {
-    req.query.url = new URL(req.originalUrl, BASE_UPSTREAM).toString();
-    return app._router.handle(req, res, next);
-  });
-}
-
-// Websocket upgrades
+// WebSocket upgrades
 server.on('upgrade', (req, socket, head) => {
   let targetUrl = null;
-
   if (BASE_UPSTREAM) {
     try {
       const base = new URL(BASE_UPSTREAM);
-      const joined = new URL(req.url, base);
-      targetUrl = joined;
+      targetUrl = new URL(req.url, base);
     } catch {
       socket.destroy();
       return;
@@ -212,12 +197,10 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
   }
-
   if (!/^https?:$/.test(targetUrl.protocol) || !isAllowedHost(targetUrl.hostname)) {
     socket.destroy();
     return;
   }
-
   proxy.ws(req, socket, head, {
     target: `${targetUrl.protocol}//${targetUrl.host}`,
     secure: true
@@ -229,6 +212,6 @@ server.listen(PORT, () => {
   if (BASE_UPSTREAM) {
     console.log(`Reverse proxy mode → ${BASE_UPSTREAM}`);
   } else {
-    console.log(`URL mode → GET /proxy?url=https://example.com`);
+    console.log(`URL mode → /?url=https://example.com`);
   }
 });
