@@ -1,21 +1,19 @@
 {
-    "name": "simple-render-proxy-backend",
-      "version": "1.0.0",
-        "type": "module",
-          "scripts": {
-              "start": "node server.js"
-                },
-                  "engines": {
-                      "node": ">=18"
-                        },
-                          "dependencies": {
-                              "compression": "^1.7.4",
-                                  "express": "^4.19.2",
-                                      "express-rate-limit": "^7.4.0",
-                                          "http-proxy": "^1.18.1",
-                                              "morgan": "^1.10.0",
-                                                  "cheerio": "^1.0.2-rc.12"
-                                                    }
-                                                    }
-                                                    
+  "name": "simple-render-proxy-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "compression": "^1.7.4",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "http-proxy": "^1.18.1",
+    "morgan": "^1.10.0",
+    "cheerio": "^1.0.2-rc.12"
+  }
 }
