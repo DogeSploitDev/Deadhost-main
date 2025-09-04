@@ -9,7 +9,7 @@ import rateLimit from 'express-rate-limit';
 import { URL } from 'url';
 import zlib from 'zlib';
 import getRawBody from 'raw-body';
-import cheerio from 'cheerio';
+import * as cheerio from 'cheerio'
 
 const app = express();
 const server = http.createServer(app);
