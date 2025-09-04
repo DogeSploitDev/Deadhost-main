@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en" style="height:100%">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Deadhost</title>
+</head>
+<body style="margin:0;height:100%">
+  <iframe
+    title="content"
+    src=""
+    width="100%"
+    height="100%"
+    frameborder="0"
+    sandbox="allow-same-origin allow-scripts allow-forms allow-popups">
+  </iframe>
+
+  <script>
+    (function(){
+      const param = new URLSearchParams(location.search).get('url');
+      if (!param) {
+        document.body.innerHTML = 'Usage: wrapper.html?url=https://example.com';
+        return;
+      }
+      let target;
+      try { target = new URL(param); }
+      catch (e) { document.body.innerHTML = 'Invalid URL'; return; }
+
+      const prox = location.origin + '/proxy?url=' + encodeURIComponent(target.toString());
+      const frame = document.getElementsByTagName('iframe')[0];
+      frame.src = prox;
+
+      setTimeout(() => {
+        try{
+          if (!frame.contentWindow || (frame.contentDocument && frame.contentDocument.location.href === 'about:blank')) {
+            // fallback to opening in new tab
+            const openBtn = document.createElement('a');
+            openBtn.href = prox;
+            openBtn.target = '_blank';
+            openBtn.rel = 'noreferrer noopener';
+            openBtn.textContent = 'Open content in a new tab (framing blocked)';
+            openBtn.style.display = 'inline-block';
+            openBtn.style.margin = '12px';
+            openBtn.style.fontFamily = 'sans-serif';
+            document.body.innerHTML = '';
+            document.body.appendChild(openBtn);
+          }
+        }catch(e){
+          // ignore
+        }
+      }, 1500);
+    })();
+  </script>
+</body>
+</html>
